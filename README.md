@@ -27,7 +27,7 @@ An interactive Streamlit web application (plus zero-dependency standalone web bu
 
 ## Deploy to Streamlit Community Cloud
 
-1. Push this directory (`dna-seq-classifier`) to a GitHub repository.
+1. Push `app.py` and `requirements.txt` (plus optional `.streamlit/config.toml`) to the root of your GitHub repository — `app.py` is self-contained with no local package subfolder dependencies.
 2. Open [Streamlit Community Cloud](https://share.streamlit.io/) and click **New app**.
 3. Select your repository, branch, and set **Main file path** to `app.py`.
 4. Click **Deploy** — Streamlit Cloud will automatically install dependencies from `requirements.txt` and apply `.streamlit/config.toml`.

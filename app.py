@@ -1,28 +1,26 @@
-"""Streamlit entrypoint for the DNA Sequence Classification Dashboard."""
+"""Self-contained Streamlit entrypoint for the DNA Sequence Classification Dashboard."""
 from __future__ import annotations
 
+from collections import Counter
+from datetime import datetime, timezone
 import html
+from typing import Any
+
+import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+from sklearn.base import clone
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import (
+    accuracy_score,
+    confusion_matrix,
+    f1_score,
+    precision_recall_fscore_support,
+)
+from sklearn.model_selection import LeaveOneOut, train_test_split
+from sklearn.tree import DecisionTreeClassifier, export_text
 import streamlit as st
-
-from bioseq.features import (
-    DEFAULT_DATASET,
-    DEFAULT_UNKNOWN,
-    FEATURE_COLUMNS,
-    OOD_PRESETS,
-    compute_group_summaries,
-    extract_dataframe_features,
-    extract_features,
-    validate_sequence,
-)
-from bioseq.modeling import predict_unknown_sequence, train_and_evaluate
-from bioseq.report import (
-    build_discussion_sections,
-    build_markdown_report,
-    build_pdf_report,
-)
 
 st.set_page_config(
     page_title="DNA Sequence Classification Dashboard",
@@ -31,7 +29,926 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# ---------------------------------------------------------------------------
+# Constants & Sample Datasets
+# ---------------------------------------------------------------------------
+
+VALID_BASES = {"A", "T", "G", "C"}
+
+FEATURE_COLUMNS = [
+    "Count of 'A'",
+    "Count of 'T'",
+    "Count of 'G'",
+    "Count of 'C'",
+    "Sequence Length",
+    "GC Content (%)",
+]
+
+DEFAULT_DATASET = [
+    {"Sequence ID": "S1", "DNA Sequence": "ATGCGATC", "Group": "Group A"},
+    {"Sequence ID": "S2", "DNA Sequence": "ATGCGTAC", "Group": "Group A"},
+    {"Sequence ID": "S3", "DNA Sequence": "GCGCGTAT", "Group": "Group B"},
+    {"Sequence ID": "S4", "DNA Sequence": "GCGCGCGC", "Group": "Group B"},
+]
+
+DEFAULT_UNKNOWN = {
+    "id": "Test",
+    "sequence": "ATGCGCGATC",
+}
+
+OOD_PRESETS = [
+    {
+        "label": "Default Test",
+        "id": "Test",
+        "sequence": "ATGCGCGATC",
+        "note": "10 bp, 60.0% GC - assignment target sequence",
+    },
+    {
+        "label": "AT-Rich Promoter",
+        "id": "OOD-AT",
+        "sequence": "ATATATATAT",
+        "note": "10 bp, 0.0% GC - extreme AT-rich sequence",
+    },
+    {
+        "label": "CpG Island Repeat",
+        "id": "OOD-CpG",
+        "sequence": "GCGCGCGCGCGC",
+        "note": "12 bp, 100.0% GC - pure GC dinucleotide repeat",
+    },
+    {
+        "label": "Long 50% GC",
+        "id": "OOD-Long50",
+        "sequence": "ATGCATGCATGCATGCATGC",
+        "note": "20 bp, 50.0% GC - tests raw count vs GC% conflict",
+    },
+    {
+        "label": "Poly-A Homopolymer",
+        "id": "OOD-PolyA",
+        "sequence": "AAAAAAAAAAAAAAAAAAAA",
+        "note": "20 bp, 0.0% GC - out-of-distribution homopolymer",
+    },
+]
+
 GROUP_COLORS = ["#0d9488", "#2563eb", "#d97706", "#9333ea", "#e11d48"]
+
+
+# ---------------------------------------------------------------------------
+# Feature Extraction & Validation
+# ---------------------------------------------------------------------------
+
+
+def _is_missing(val: Any) -> bool:
+    return val is None or (isinstance(val, float) and val != val)
+
+
+def _clean_text(val: Any, fallback: str) -> str:
+    if _is_missing(val):
+        return fallback
+    cleaned = str(val).strip()
+    return cleaned if cleaned else fallback
+
+
+def normalize_sequence(raw: Any) -> str:
+    """Strip surrounding whitespace and uppercase a DNA sequence string."""
+    if _is_missing(raw):
+        return ""
+    return str(raw).strip().upper()
+
+
+def validate_sequence(raw: Any) -> dict[str, Any]:
+    """Validate that a DNA sequence is non-empty and contains only A, T, G, C."""
+    cleaned = normalize_sequence(raw)
+    if not cleaned:
+        return {
+            "valid": False,
+            "cleaned": "",
+            "invalid_chars": [],
+            "message": "Sequence cannot be empty. Enter bases using A, T, G, C.",
+        }
+
+    invalid: list[tuple[str, int]] = []
+    for idx, ch in enumerate(cleaned, start=1):
+        if ch not in VALID_BASES:
+            invalid.append(("SPACE" if ch == " " else ch, idx))
+
+    if invalid:
+        unique_bad = list(dict.fromkeys(ch for ch, _ in invalid))[:5]
+        preview = ", ".join(f"'{ch}' @ pos {pos}" for ch, pos in invalid[:4])
+        return {
+            "valid": False,
+            "cleaned": cleaned,
+            "invalid_chars": invalid,
+            "message": (
+                f"Invalid base(s) detected ({', '.join(unique_bad)}): {preview}. "
+                "Only A, T, G, C are permitted."
+            ),
+        }
+
+    return {
+        "valid": True,
+        "cleaned": cleaned,
+        "invalid_chars": [],
+        "message": f"Valid DNA sequence ({len(cleaned)} bp, bases A/T/G/C only).",
+    }
+
+
+def extract_features(raw_sequence: Any) -> dict[str, Any]:
+    """Compute the 6 mandatory numerical features for a DNA sequence."""
+    seq = normalize_sequence(raw_sequence)
+    count_a = seq.count("A")
+    count_t = seq.count("T")
+    count_g = seq.count("G")
+    count_c = seq.count("C")
+    length = len(seq)
+    gc_content = ((count_g + count_c) / length) * 100.0 if length > 0 else 0.0
+
+    return {
+        "sequence": seq,
+        "count_a": count_a,
+        "count_t": count_t,
+        "count_g": count_g,
+        "count_c": count_c,
+        "length": length,
+        "gc_content": gc_content,
+        "vector": [count_a, count_t, count_g, count_c, length, gc_content],
+    }
+
+
+def extract_dataframe_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Enrich a raw dataset DataFrame with validation flags and extracted 6 features."""
+    enriched: list[dict[str, Any]] = []
+    for idx, row in enumerate(df.to_dict(orient="records"), start=1):
+        seq_id = _clean_text(row.get("Sequence ID"), f"S{idx}")
+        group = _clean_text(row.get("Group"), "Unassigned")
+        val = validate_sequence(row.get("DNA Sequence", ""))
+        feats = extract_features(val["cleaned"])
+        enriched.append(
+            {
+                "Sequence ID": seq_id,
+                "Group": group,
+                "DNA Sequence": val["cleaned"],
+                "Count of 'A'": feats["count_a"],
+                "Count of 'T'": feats["count_t"],
+                "Count of 'G'": feats["count_g"],
+                "Count of 'C'": feats["count_c"],
+                "Sequence Length": feats["length"],
+                "GC Content (%)": round(feats["gc_content"], 2),
+                "Valid": val["valid"],
+                "Validation Note": val["message"],
+            }
+        )
+    return pd.DataFrame(enriched)
+
+
+def compute_group_summaries(enriched_df: pd.DataFrame) -> pd.DataFrame:
+    """Compute mean feature values per biological group for valid sequences."""
+    valid_df = enriched_df[enriched_df["Valid"]].copy()
+    if valid_df.empty:
+        return valid_df
+
+    return (
+        valid_df.groupby("Group", as_index=False)
+        .agg(
+            N=("Sequence ID", "count"),
+            **{col: (col, "mean") for col in FEATURE_COLUMNS},
+        )
+        .sort_values("Group")
+    )
+
+
+# ---------------------------------------------------------------------------
+# Machine Learning Pipeline (scikit-learn)
+# ---------------------------------------------------------------------------
+
+
+def build_classifier(config: dict[str, Any]):
+    """Instantiate a scikit-learn DecisionTreeClassifier or RandomForestClassifier."""
+    criterion = "entropy" if config.get("criterion") == "entropy" else "gini"
+    max_depth = None if config.get("unlimited_depth") else int(config.get("max_depth") or 5)
+    min_samples_split = max(2, int(config.get("min_samples_split") or 2))
+    random_state = int(config.get("random_state") if config.get("random_state") is not None else 42)
+
+    if config.get("classifier") == "decision_tree":
+        return DecisionTreeClassifier(
+            criterion=criterion,
+            max_depth=max_depth,
+            min_samples_split=min_samples_split,
+            random_state=random_state,
+        )
+
+    max_features = config.get("max_features")
+    if max_features == "all":
+        max_features = None
+    elif max_features not in ("sqrt", "log2"):
+        max_features = "sqrt"
+
+    return RandomForestClassifier(
+        n_estimators=max(1, min(200, int(config.get("n_estimators") or 50))),
+        criterion=criterion,
+        max_depth=max_depth,
+        min_samples_split=min_samples_split,
+        max_features=max_features,
+        random_state=random_state,
+    )
+
+
+def describe_learned_rules(model, feature_names: list[str]) -> str:
+    """Format Decision Tree rules or top Random Forest estimators as readable text."""
+    if isinstance(model, DecisionTreeClassifier):
+        if model.tree_.node_count == 1:
+            return "Single root leaf (no discriminatory splits needed)."
+        return export_text(model, feature_names=feature_names, decimals=2)
+
+    if isinstance(model, RandomForestClassifier):
+        blocks: list[str] = []
+        total = len(model.estimators_)
+        for idx, est in enumerate(model.estimators_[:3], start=1):
+            if est.tree_.node_count == 1:
+                rules = "  (Single leaf node from bootstrap sample)"
+            else:
+                rules = export_text(est, feature_names=feature_names, decimals=2)
+            blocks.append(f"[Tree #{idx} of {total}]\n{rules}")
+        return "\n".join(blocks)
+
+    return "Rule inspection unavailable for this estimator."
+
+
+def _compute_eval_bundle(
+    classes: list[str],
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    eval_ids: list[str],
+) -> dict[str, Any]:
+    acc = float(accuracy_score(y_true, y_pred))
+    correct = int(np.sum(y_true == y_pred))
+    total = int(len(y_true))
+    macro_f1 = float(f1_score(y_true, y_pred, labels=classes, average="macro", zero_division=0))
+    cm = confusion_matrix(y_true, y_pred, labels=classes)
+
+    prec, rec, f1, sup = precision_recall_fscore_support(
+        y_true, y_pred, labels=classes, zero_division=0
+    )
+    per_class_df = pd.DataFrame(
+        {
+            "Class": classes,
+            "Precision": [round(float(v) * 100, 1) for v in prec],
+            "Recall": [round(float(v) * 100, 1) for v in rec],
+            "F1 (%)": [round(float(v) * 100, 1) for v in f1],
+            "Support": [int(v) for v in sup],
+        }
+    )
+
+    eval_predictions_df = pd.DataFrame(
+        {
+            "Sequence ID": eval_ids,
+            "Actual": list(y_true),
+            "Predicted": list(y_pred),
+            "Correct": [bool(a == p) for a, p in zip(y_true, y_pred)],
+        }
+    )
+
+    return {
+        "accuracy": acc,
+        "correct": correct,
+        "total": total,
+        "macro_f1": macro_f1,
+        "confusion_matrix": cm,
+        "per_class_df": per_class_df,
+        "eval_predictions_df": eval_predictions_df,
+    }
+
+
+def train_and_evaluate(enriched_df: pd.DataFrame, config: dict[str, Any]) -> dict[str, Any]:
+    """Train classifier and compute evaluation metrics under the chosen strategy."""
+    valid_df = enriched_df[enriched_df["Valid"]].reset_index(drop=True)
+    if len(valid_df) < 2:
+        return {"error": "At least 2 valid sequences are required to train a classifier."}
+
+    X = valid_df[FEATURE_COLUMNS].to_numpy(dtype=float)
+    y = valid_df["Group"].astype(str).to_numpy()
+    ids = valid_df["Sequence ID"].astype(str).tolist()
+    classes = sorted(set(y.tolist()))
+
+    base_model = build_classifier(config)
+
+    if len(classes) < 2:
+        deployed_model = clone(base_model).fit(X, y)
+        bundle = _compute_eval_bundle(classes, y, y, ids)
+        imp_df = pd.DataFrame(
+            {
+                "Feature": FEATURE_COLUMNS,
+                "Importance": deployed_model.feature_importances_,
+                "Importance (%)": deployed_model.feature_importances_ * 100.0,
+            }
+        ).sort_values("Importance", ascending=False)
+        return {
+            "error": None,
+            "warning": "Only 1 group is present in valid sequences. Add samples from at least 2 groups for meaningful classification.",
+            "classes": classes,
+            "eval_mode": config.get("eval_mode", "full"),
+            "eval_description": "Single-class dataset (trivial fit)",
+            "deployed_model": deployed_model,
+            "feature_importances_df": imp_df,
+            "rules_text": describe_learned_rules(deployed_model, FEATURE_COLUMNS),
+            "sample_count": len(valid_df),
+            **bundle,
+        }
+
+    eval_mode = config.get("eval_mode", "full")
+    seed = int(config.get("random_state") if config.get("random_state") is not None else 42)
+
+    if eval_mode == "loocv":
+        loo = LeaveOneOut()
+        y_true_list: list[str] = []
+        y_pred_list: list[str] = []
+        eval_ids: list[str] = []
+        for fold_idx, (train_idx, test_idx) in enumerate(loo.split(X)):
+            fold_model = clone(base_model)
+            if hasattr(fold_model, "random_state"):
+                fold_model.set_params(random_state=seed + fold_idx)
+            fold_model.fit(X[train_idx], y[train_idx])
+            y_true_list.append(str(y[test_idx[0]]))
+            y_pred_list.append(str(fold_model.predict(X[test_idx])[0]))
+            eval_ids.append(ids[test_idx[0]])
+
+        deployed_model = clone(base_model).fit(X, y)
+        y_true_arr = np.array(y_true_list)
+        y_pred_arr = np.array(y_pred_list)
+        eval_desc = (
+            f"Leave-One-Out Cross-Validation ({len(valid_df)} folds; "
+            f"deployed model fitted on all {len(valid_df)} samples)"
+        )
+    elif eval_mode == "split":
+        class_counts = Counter(y.tolist())
+        if min(class_counts.values()) < 2:
+            return {
+                "error": (
+                    "Stratified Train/Test Split requires at least 2 sequences per group. "
+                    "Add more sequences or use Full-Fit / Leave-One-Out CV."
+                )
+            }
+        test_ratio = float(config.get("test_ratio") or 0.5)
+        indices = np.arange(len(valid_df))
+        train_idx, test_idx = train_test_split(
+            indices, test_size=test_ratio, random_state=seed, stratify=y
+        )
+        deployed_model = clone(base_model).fit(X[train_idx], y[train_idx])
+        y_true_arr = y[test_idx]
+        y_pred_arr = deployed_model.predict(X[test_idx])
+        eval_ids = [ids[i] for i in test_idx]
+        eval_desc = (
+            f"Stratified Train/Test Split ({len(train_idx)} train / {len(test_idx)} test samples)"
+        )
+    else:
+        deployed_model = clone(base_model).fit(X, y)
+        y_true_arr = y
+        y_pred_arr = deployed_model.predict(X)
+        eval_ids = ids
+        eval_desc = f"Full-Fit Resubstitution (trained & evaluated on all {len(valid_df)} samples)"
+
+    bundle = _compute_eval_bundle(classes, y_true_arr, y_pred_arr, eval_ids)
+    importances = deployed_model.feature_importances_
+    imp_df = (
+        pd.DataFrame(
+            {
+                "Feature": FEATURE_COLUMNS,
+                "Importance": importances,
+                "Importance (%)": importances * 100.0,
+            }
+        )
+        .sort_values("Importance", ascending=False)
+        .reset_index(drop=True)
+    )
+
+    return {
+        "error": None,
+        "warning": None,
+        "classes": classes,
+        "eval_mode": eval_mode,
+        "eval_description": eval_desc,
+        "deployed_model": deployed_model,
+        "feature_importances_df": imp_df,
+        "rules_text": describe_learned_rules(deployed_model, FEATURE_COLUMNS),
+        "sample_count": len(valid_df),
+        **bundle,
+    }
+
+
+def explain_unknown_prediction(model, x_vec: np.ndarray, classes: list[str]) -> dict[str, Any]:
+    """Build human-readable decision path or Random Forest tree vote breakdown."""
+    if isinstance(model, DecisionTreeClassifier):
+        tree = model.tree_
+        node_indicator = model.decision_path(x_vec)
+        node_indices = node_indicator.indices[
+            node_indicator.indptr[0] : node_indicator.indptr[1]
+        ]
+        steps: list[str] = []
+        for node_id in node_indices:
+            if tree.children_left[node_id] == tree.children_right[node_id]:
+                continue
+            feat_idx = int(tree.feature[node_id])
+            thr = float(tree.threshold[node_id])
+            val = float(x_vec[0, feat_idx])
+            direction = "<=" if val <= thr else ">"
+            steps.append(f"{FEATURE_COLUMNS[feat_idx]} ({val:.2f}) {direction} {thr:.2f}")
+        return {"mode": "decision_tree", "steps": steps}
+
+    if isinstance(model, RandomForestClassifier):
+        votes: Counter[str] = Counter({cls: 0 for cls in classes})
+        root_splits: Counter[str] = Counter()
+        for est in model.estimators_:
+            pred_idx = int(est.predict(x_vec)[0])
+            votes[str(model.classes_[pred_idx])] += 1
+            if est.tree_.node_count > 1:
+                root_feat_idx = int(est.tree_.feature[0])
+                if 0 <= root_feat_idx < len(FEATURE_COLUMNS):
+                    root_splits[FEATURE_COLUMNS[root_feat_idx]] += 1
+        return {
+            "mode": "random_forest",
+            "votes": dict(votes),
+            "total_trees": len(model.estimators_),
+            "root_splits": dict(root_splits),
+        }
+
+    return {"mode": "generic"}
+
+
+def predict_unknown_sequence(model, raw_seq: str, seq_id: str) -> dict[str, Any]:
+    """Validate an unknown sequence, extract features, and run classifier inference."""
+    val = validate_sequence(raw_seq)
+    feats = extract_features(val["cleaned"])
+    clean_id = str(seq_id or "").strip() or "Unknown"
+
+    if not val["valid"] or model is None:
+        return {
+            "valid": val["valid"],
+            "id": clean_id,
+            "validation": val,
+            "features": feats,
+            "error": True,
+        }
+
+    x_vec = np.array([feats["vector"]], dtype=float)
+    classes = [str(c) for c in model.classes_]
+    probs_arr = model.predict_proba(x_vec)[0]
+    probabilities = {cls: float(p) for cls, p in zip(classes, probs_arr)}
+    predicted_class = str(model.predict(x_vec)[0])
+    confidence = probabilities.get(predicted_class, float(np.max(probs_arr)))
+    explanation = explain_unknown_prediction(model, x_vec, classes)
+
+    return {
+        "valid": True,
+        "id": clean_id,
+        "validation": val,
+        "features": feats,
+        "predicted_class": predicted_class,
+        "confidence": confidence,
+        "probabilities": probabilities,
+        "explanation": explanation,
+        "error": False,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Academic Discussion & Report Exports
+# ---------------------------------------------------------------------------
+
+
+def _find_feature_collisions(valid_df: pd.DataFrame) -> list[list[str]]:
+    groups: dict[tuple, list[tuple[str, str]]] = {}
+    for _, row in valid_df.iterrows():
+        key = tuple(round(float(row[c]), 4) for c in FEATURE_COLUMNS)
+        groups.setdefault(key, []).append((str(row["Sequence ID"]), str(row["DNA Sequence"])))
+
+    collisions: list[list[str]] = []
+    for items in groups.values():
+        distinct_seqs = {seq for _, seq in items}
+        if len(items) > 1 and len(distinct_seqs) > 1:
+            collisions.append([f"{sid} ({seq})" for sid, seq in items])
+    return collisions
+
+
+def build_discussion_sections(
+    enriched_df: pd.DataFrame,
+    train_result: dict[str, Any] | None,
+    prediction_result: dict[str, Any] | None,
+    config: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Synthesize the 5 academic discussion answers backed by live pipeline metrics."""
+    valid_df = enriched_df[enriched_df["Valid"]]
+    n_samples = len(valid_df)
+    lengths = valid_df["Sequence Length"].tolist() if n_samples else [0]
+    min_len = min(lengths)
+    max_len = max(lengths)
+
+    if train_result and not train_result.get("error"):
+        imp_df = train_result["feature_importances_df"]
+        active_feats = imp_df[imp_df["Importance"] > 0.001]
+        zero_feats = imp_df[imp_df["Importance"] <= 0.001]["Feature"].tolist()
+        if not active_feats.empty:
+            top_str = ", ".join(
+                f"{row['Feature']} ({row['Importance (%)']:.1f}%)"
+                for _, row in active_feats.head(3).iterrows()
+            )
+        else:
+            top_str = "No active discriminatory splits (all features tied at 0%)"
+        acc_pct = f"{train_result['accuracy'] * 100:.1f}%"
+        f1_pct = f"{train_result['macro_f1'] * 100:.1f}%"
+        eval_desc = train_result["eval_description"]
+    else:
+        top_str = "N/A (model not trained)"
+        zero_feats = []
+        acc_pct = "N/A"
+        f1_pct = "N/A"
+        eval_desc = "N/A"
+
+    depth_lbl = "None" if config.get("unlimited_depth") else str(config.get("max_depth", 5))
+    if config.get("classifier") == "decision_tree":
+        model_label = f"Decision Tree Classifier (criterion={config.get('criterion')}, max_depth={depth_lbl})"
+    else:
+        model_label = (
+            f"Random Forest Classifier (n_estimators={config.get('n_estimators')}, "
+            f"criterion={config.get('criterion')}, max_depth={depth_lbl})"
+        )
+
+    zero_note = (
+        f"Features contributing minimal or zero split gain include {', '.join(zero_feats)}"
+        + (
+            f" (notably, Sequence Length is constant at {min_len} bp across all {n_samples} training sequences, yielding zero variance)."
+            if min_len == max_len and "Sequence Length" in zero_feats
+            else "."
+        )
+        if zero_feats
+        else "All six extracted features contributed non-zero impurity reduction across tree splits."
+    )
+
+    sec1 = [
+        f"In the active {model_label}, the top discriminatory features ranked by normalized impurity decrease are: {top_str}.",
+        zero_note,
+        (
+            "Biologically and mathematically, GC Content (%) and Count of 'G' / 'C' (or complementary 'A' depletion) "
+            "capture base-composition shifts between balanced sequences (e.g., Group A at 50.0% GC) and GC-enriched "
+            "sequences (e.g., Group B at 62.5%-100.0% GC). Unlike raw base counts, GC Content (%) normalizes by sequence "
+            "length and remains scale-invariant across sequences of differing lengths."
+        ),
+    ]
+
+    collisions = _find_feature_collisions(valid_df)
+    collision_note = (
+        "Feature-space inspection reveals an exact collision between "
+        + "; ".join(" and ".join(grp) for grp in collisions)
+        + ": despite differing nucleotide orders, they map to identical 6-feature vectors."
+        if collisions
+        else "All valid training sequences currently map to distinct 6-feature vectors."
+    )
+
+    if prediction_result and not prediction_result.get("error"):
+        f = prediction_result["features"]
+        probs_str = ", ".join(
+            f"{cls}: {p * 100:.1f}%"
+            for cls, p in sorted(prediction_result["probabilities"].items(), key=lambda kv: -kv[1])
+        )
+        len_mismatch = f["length"] < min_len or f["length"] > max_len
+        pred_sanity = (
+            f"For target sequence \"{prediction_result['id']}\" ({f['sequence']}, {f['length']} bp, "
+            f"GC={f['gc_content']:.1f}%), the model predicts {prediction_result['predicted_class']} ({probs_str}). "
+            + (
+                f"Because this sequence length ({f['length']} bp) differs from the training length range ({min_len}-{max_len} bp), "
+                f"raw counts (A={f['count_a']}, G={f['count_g']}) can diverge from length-normalized GC Content ({f['gc_content']:.1f}%): "
+                f"A={f['count_a']} equals an 8 bp Group A raw count while representing {f['count_a']/f['length']*100:.1f}% A-content, "
+                f"whereas GC={f['gc_content']:.1f}% and G={f['count_g']} align with GC-rich Group B."
+                if len_mismatch
+                else f"Its length ({f['length']} bp) sits within the training length range ({min_len}-{max_len} bp), keeping raw base counts and GC% consistent."
+            )
+        )
+    else:
+        pred_sanity = "Execute a valid prediction in the Predict Unknown tab to audit inference behavior against training bounds."
+
+    sec2 = [
+        f"Under {eval_desc}, the classifier achieved {acc_pct} accuracy (Macro-F1: {f1_pct}) across {n_samples} valid sequences.",
+        collision_note,
+        (
+            f"Sanity check on small-sample splits: With N={n_samples} training observations, multiple features "
+            "(such as Count of 'A', Count of 'G', and GC Content %) can tie for identical impurity gain at the root split. "
+            "A single Decision Tree breaks ties using seeded feature permutation, whereas Random Forest aggregates bootstrap trees "
+            "over feature subsets—yielding calibrated ensemble probabilities that are less sensitive to a single tie choice."
+        ),
+        pred_sanity,
+    ]
+
+    sec3 = [
+        (
+            f"Tree-based classifiers partition the 6-feature space using axis-aligned thresholds learned strictly from training "
+            f"sequences (lengths {min_len}-{max_len} bp). When evaluated on out-of-distribution (OOD) sequences, tree models cannot "
+            "flag inputs as 'unknown' or 'out-of-domain'—every input is routed into a leaf belonging to an existing training class."
+        ),
+        (
+            "Two OOD failure modes arise directly from unnormalized counts: (1) Length-scaling drift: a 20 bp balanced sequence "
+            "(e.g., ATGCATGCATGCATGCATGC, 50% GC) has Count of 'G'=5 and Count of 'C'=5, exceeding Group B thresholds on raw G/C counts "
+            "even though its 50% GC matches Group A. Conversely, a 2 bp fragment like 'GC' (100% GC) has G=1, C=1 and falls below Group B count thresholds."
+        ),
+        (
+            "(2) Unseen compositional extremes: homopolymers such as Poly-A (20 bp, 0% GC) or Poly-T (8 bp, 0% GC) lie far outside training "
+            "distributions yet still receive confident predictions because leaf probabilities reflect training node purity rather than distance from the training manifold."
+        ),
+    ]
+
+    sec4 = [
+        (
+            "1. CpG Island Detection: Mammalian gene promoters frequently contain unmethylated CpG islands—stretches of 200-2000 bp "
+            "with GC content >50-55% and elevated CpG dinucleotide density. Composition classifiers separate GC-rich regulatory islands "
+            "(analogous to Group B) from AT-rich bulk genomic background."
+        ),
+        (
+            "2. Promoter & Regulatory Element Identification: Core promoters (e.g., AT-rich TATA-box regions) versus housekeeping gene "
+            "promoters (GC-rich Sp1 binding sites) exhibit measurable compositional signatures useful in first-pass genome annotation."
+        ),
+        (
+            "3. Viral Strain Typing & Metagenomic Binning: Bacterial taxa, viral clades, and horizontally transferred pathogenicity islands "
+            "carry characteristic genomic GC signatures. Rapid k-mer and GC-profile Random Forests help bin metagenomic contigs and flag anomalous inserts."
+        ),
+    ]
+
+    sec5 = [
+        (
+            "1. Positional & Motif Context Loss (Bag-of-Bases Bottleneck): Counting A, T, G, C discards nucleotide order completely. "
+            "Biological function depends on exact motifs (e.g., TATAAT boxes, EcoRI site GAATTC, GT/AG splice junctions) and dinucleotide order. "
+            "For example, GCGCGCGC (CpG island repeat) and GGGGCCCC (homopolymer blocks) yield identical 6-feature vectors "
+            "[A=0, T=0, G=4, C=4, Length=8, GC=100%], just as S1 (ATGCGATC) and S2 (ATGCGTAC) collide. Modern genomics addresses this with "
+            "k-mer spectra, Position Weight Matrices (PWMs), 1D-CNNs, and genomic foundation models (e.g., DNABERT)."
+        ),
+        (
+            "2. Unnormalized Feature Confounding: Mixing raw base counts with Sequence Length lets classifiers overfit dataset-specific "
+            "read or amplicon lengths rather than underlying biological composition."
+        ),
+        (
+            "3. Small-Sample Overfitting & Dataset Bias: Limited labeled datasets (like N=4), PCR GC-amplification bias, class imbalance, "
+            "and evolutionary homology across samples can inflate naive evaluation accuracy unless validated with strict cross-validation or homology-aware splits."
+        ),
+    ]
+
+    return [
+        {"num": "01", "title": "Most Useful Features (Feature Importance Analysis)", "paragraphs": sec1},
+        {"num": "02", "title": "Model Sanity Check & Correctness Analysis", "paragraphs": sec2},
+        {"num": "03", "title": "Out-of-Distribution (OOD) Sequence Behavior", "paragraphs": sec3},
+        {"num": "04", "title": "Real-World Genomics Applications", "paragraphs": sec4},
+        {"num": "05", "title": "Fundamental Limitations of AI/ML in Genomics", "paragraphs": sec5},
+    ]
+
+
+def build_markdown_report(
+    enriched_df: pd.DataFrame,
+    train_result: dict[str, Any] | None,
+    prediction_result: dict[str, Any] | None,
+    config: dict[str, Any],
+) -> str:
+    """Generate a structured Markdown deliverable with tables, metrics, and discussion."""
+    valid_df = enriched_df[enriched_df["Valid"]]
+    discussion = build_discussion_sections(enriched_df, train_result, prediction_result, config)
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    lines = [
+        "# Computational Biology Assignment Report: DNA Sequence Classification",
+        "",
+        f"**Generated:** {now_str}",
+        f"**Classifier:** {'Decision Tree Classifier' if config.get('classifier') == 'decision_tree' else 'Random Forest Classifier'}",
+        (
+            f"**Hyperparameters:** `criterion={config.get('criterion')}`, "
+            f"`max_depth={'None' if config.get('unlimited_depth') else config.get('max_depth')}`, "
+            f"`min_samples_split={config.get('min_samples_split')}`"
+            + (f", `n_estimators={config.get('n_estimators')}`" if config.get("classifier") != "decision_tree" else "")
+            + f", `random_state={config.get('random_state')}`"
+        ),
+        f"**Evaluation Mode:** {train_result['eval_description'] if train_result and not train_result.get('error') else 'N/A'}",
+        "",
+        "## 1. Dataset & Extracted 6-Feature Table",
+        "",
+        "| Seq ID | Group | DNA Sequence | A | T | G | C | Length | GC Content (%) |",
+        "| :--- | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: |",
+    ]
+
+    for _, r in valid_df.iterrows():
+        ca = int(r["Count of 'A'"])
+        ct = int(r["Count of 'T'"])
+        cg = int(r["Count of 'G'"])
+        cc = int(r["Count of 'C'"])
+        seq_len = int(r["Sequence Length"])
+        gc_pct = float(r["GC Content (%)"])
+        lines.append(
+            f"| {r['Sequence ID']} | {r['Group']} | `{r['DNA Sequence']}` | "
+            f"{ca} | {ct} | {cg} | {cc} | {seq_len} | {gc_pct:.2f}% |"
+        )
+    lines.append("")
+
+    if train_result and not train_result.get("error"):
+        classes = train_result["classes"]
+        cm = train_result["confusion_matrix"]
+        lines.extend(
+            [
+                "## 2. Model Evaluation Metrics",
+                "",
+                f"- **Accuracy:** {train_result['accuracy'] * 100:.2f}% ({train_result['correct']}/{train_result['total']})",
+                f"- **Macro-F1 Score:** {train_result['macro_f1'] * 100:.2f}%",
+                "",
+                "### Confusion Matrix (Rows = Actual, Columns = Predicted)",
+                "",
+                "| Actual \\ Predicted | " + " | ".join(classes) + " |",
+                "| :--- | " + " | ".join("---:" for _ in classes) + " |",
+            ]
+        )
+        for r_idx, cls in enumerate(classes):
+            counts = " | ".join(str(int(v)) for v in cm[r_idx])
+            lines.append(f"| **{cls}** | {counts} |")
+        lines.extend(
+            [
+                "",
+                "### Feature Importances",
+                "",
+                "| Feature | Normalized Importance |",
+                "| :--- | ---: |",
+            ]
+        )
+        for _, row in train_result["feature_importances_df"].iterrows():
+            lines.append(f"| {row['Feature']} | {row['Importance (%)']:.2f}% |")
+        lines.append("")
+
+    if prediction_result and not prediction_result.get("error"):
+        f = prediction_result["features"]
+        probs = " | ".join(
+            f"{cls}: {p * 100:.1f}%"
+            for cls, p in sorted(prediction_result["probabilities"].items(), key=lambda kv: -kv[1])
+        )
+        lines.extend(
+            [
+                "## 3. Unknown Sequence Prediction",
+                "",
+                f"- **Sequence ID:** {prediction_result['id']}",
+                f"- **Input Sequence:** `{f['sequence']}`",
+                (
+                    f"- **Extracted Features:** A={f['count_a']}, T={f['count_t']}, G={f['count_g']}, "
+                    f"C={f['count_c']}, Length={f['length']} bp, GC Content={f['gc_content']:.2f}%"
+                ),
+                f"- **Predicted Group:** **{prediction_result['predicted_class']}**",
+                f"- **Class Probabilities:** {probs}",
+                "",
+            ]
+        )
+
+    lines.extend(["## 4. Academic Analysis & Critical Discussion", ""])
+    for sec in discussion:
+        lines.append(f"### {sec['num']}. {sec['title']}")
+        lines.append("")
+        for p in sec["paragraphs"]:
+            lines.append(p)
+            lines.append("")
+
+    return "\n".join(lines)
+
+
+def _ascii_safe(text: str) -> str:
+    replacements = {
+        "\u2014": "--",
+        "\u2013": "-",
+        "\u2192": "->",
+        "\u2264": "<=",
+        "\u2265": ">=",
+        "\u00d7": "x",
+        "\u2018": "'",
+        "\u2019": "'",
+        "\u201c": '"',
+        "\u201d": '"',
+    }
+    out = str(text)
+    for src, dst in replacements.items():
+        out = out.replace(src, dst)
+    return out.encode("latin-1", errors="replace").decode("latin-1")
+
+
+def _pdf_to_bytes(pdf) -> bytes:
+    import fpdf
+
+    major_ver = int(str(getattr(fpdf, "__version__", "2")).split(".")[0])
+    out = pdf.output(dest="S") if major_ver < 2 else pdf.output()
+    if isinstance(out, (bytes, bytearray)):
+        return bytes(out)
+    return str(out).encode("latin-1", errors="replace")
+
+
+def build_pdf_report(
+    enriched_df: pd.DataFrame,
+    train_result: dict[str, Any] | None,
+    prediction_result: dict[str, Any] | None,
+    config: dict[str, Any],
+) -> bytes:
+    """Render a structured academic PDF summary using fpdf2 / fpdf."""
+    from fpdf import FPDF
+
+    valid_df = enriched_df[enriched_df["Valid"]]
+    discussion = build_discussion_sections(enriched_df, train_result, prediction_result, config)
+
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+
+    pdf.set_font("Helvetica", "B", 15)
+    pdf.cell(0, 9, _ascii_safe("DNA Sequence Classification - Academic Report"), ln=1)
+    pdf.set_font("Helvetica", "", 9.5)
+    model_name = "Decision Tree Classifier" if config.get("classifier") == "decision_tree" else "Random Forest Classifier"
+    pdf.cell(
+        0,
+        6,
+        _ascii_safe(f"Generated {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')} | Model: {model_name}"),
+        ln=1,
+    )
+    pdf.ln(3)
+
+    pdf.set_font("Helvetica", "B", 12)
+    pdf.cell(0, 7, "1. Training Dataset & Extracted Features", ln=1)
+    pdf.set_font("Helvetica", "B", 8.5)
+    col_widths = [18, 22, 42, 12, 12, 12, 12, 16, 22]
+    headers = ["ID", "Group", "Sequence", "A", "T", "G", "C", "Len", "GC %"]
+    for w, h in zip(col_widths, headers):
+        pdf.cell(w, 6, h, border=1)
+    pdf.ln()
+
+    pdf.set_font("Helvetica", "", 8.5)
+    for _, r in valid_df.iterrows():
+        vals = [
+            str(r["Sequence ID"])[:10],
+            str(r["Group"])[:12],
+            str(r["DNA Sequence"])[:22],
+            str(int(r["Count of 'A'"])),
+            str(int(r["Count of 'T'"])),
+            str(int(r["Count of 'G'"])),
+            str(int(r["Count of 'C'"])),
+            str(int(r["Sequence Length"])),
+            f"{float(r['GC Content (%)']):.1f}%",
+        ]
+        for w, v in zip(col_widths, vals):
+            pdf.cell(w, 6, _ascii_safe(v), border=1)
+        pdf.ln()
+    pdf.ln(4)
+
+    pdf.set_font("Helvetica", "B", 12)
+    pdf.cell(0, 7, "2. Model Evaluation & Feature Importance", ln=1)
+    pdf.set_font("Helvetica", "", 9.5)
+    if train_result and not train_result.get("error"):
+        pdf.multi_cell(
+            0,
+            5.5,
+            _ascii_safe(
+                f"Evaluation: {train_result['eval_description']}\n"
+                f"Accuracy: {train_result['accuracy']*100:.1f}% ({train_result['correct']}/{train_result['total']}) | "
+                f"Macro-F1: {train_result['macro_f1']*100:.1f}%"
+            ),
+        )
+        pdf.ln(1)
+        for _, row in train_result["feature_importances_df"].iterrows():
+            pdf.cell(0, 5, _ascii_safe(f"  - {row['Feature']}: {row['Importance (%)']:.1f}%"), ln=1)
+    else:
+        pdf.cell(0, 6, "Model training unavailable.", ln=1)
+    pdf.ln(3)
+
+    pdf.set_font("Helvetica", "B", 12)
+    pdf.cell(0, 7, "3. Unknown Sequence Prediction", ln=1)
+    pdf.set_font("Helvetica", "", 9.5)
+    if prediction_result and not prediction_result.get("error"):
+        f = prediction_result["features"]
+        probs = ", ".join(
+            f"{cls}: {p*100:.1f}%"
+            for cls, p in sorted(prediction_result["probabilities"].items(), key=lambda kv: -kv[1])
+        )
+        pdf.multi_cell(
+            0,
+            5.5,
+            _ascii_safe(
+                f"Target: {prediction_result['id']} ({f['sequence']})\n"
+                f"Features: A={f['count_a']}, T={f['count_t']}, G={f['count_g']}, C={f['count_c']}, "
+                f"Length={f['length']} bp, GC={f['gc_content']:.1f}%\n"
+                f"Predicted Group: {prediction_result['predicted_class']} ({probs})"
+            ),
+        )
+    else:
+        pdf.cell(0, 6, "No valid inference result available.", ln=1)
+    pdf.ln(4)
+
+    pdf.set_font("Helvetica", "B", 12)
+    pdf.cell(0, 7, "4. Critical Discussion & Analysis", ln=1)
+    for sec in discussion:
+        pdf.set_font("Helvetica", "B", 10)
+        pdf.multi_cell(0, 5.5, _ascii_safe(f"{sec['num']}. {sec['title']}"))
+        pdf.set_font("Helvetica", "", 9.2)
+        for p in sec["paragraphs"]:
+            pdf.multi_cell(0, 5, _ascii_safe(p))
+            pdf.ln(1)
+        pdf.ln(1.5)
+
+    return _pdf_to_bytes(pdf)
+
+
+# ---------------------------------------------------------------------------
+# Streamlit UI Rendering
+# ---------------------------------------------------------------------------
 
 
 def inject_custom_css() -> None:
@@ -156,7 +1073,7 @@ def render_dna_ribbon(sequence: str) -> str:
     return f"<div class='dna-ribbon'>{''.join(tiles)}{extra}</div>"
 
 
-def render_sidebar(enriched_df: pd.DataFrame) -> dict:
+def render_sidebar(enriched_df: pd.DataFrame) -> dict[str, Any]:
     with st.sidebar:
         st.title("BioSeqML")
         st.caption("DNA Sequence Classification Studio")
@@ -545,7 +1462,6 @@ def render_tab_predict(enriched_df: pd.DataFrame, train_result: dict, config: di
                 )
                 st.info(f"**Ensemble Votes:** {votes_str}  \n**Top Root Splits:** {top_roots or 'Constant leaves'}")
 
-    # 6 Extracted Feature Badge Cards
     st.markdown("#### Extracted Features for Input Sequence")
     feats = extract_features(val["cleaned"])
     length = feats["length"]
@@ -561,7 +1477,6 @@ def render_tab_predict(enriched_df: pd.DataFrame, train_result: dict, config: di
     for col, (lbl, val_str, delta_str) in zip(f_cols, f_cards):
         col.metric(lbl, val_str, delta_str)
 
-    # Length-Normalized Composition Comparison
     summary_df = compute_group_summaries(enriched_df)
     if val["valid"] and not summary_df.empty and length > 0:
         st.markdown("#### Length-Normalized Composition Comparison (%)")
@@ -626,7 +1541,9 @@ def render_tab_discussion(enriched_df: pd.DataFrame, train_result: dict, pred_re
 
     sections = build_discussion_sections(enriched_df, train_result, pred_result, config)
     for sec in sections:
-        paragraphs_html = "".join(f"<p style='color:#334155;line-height:1.6;'>{html.escape(p)}</p>" for p in sec["paragraphs"])
+        paragraphs_html = "".join(
+            f"<p style='color:#334155;line-height:1.6;'>{html.escape(p)}</p>" for p in sec["paragraphs"]
+        )
         st.markdown(
             f"""
             <div class="discussion-card">
