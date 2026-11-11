@@ -1,0 +1,462 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DNA Sequence Classifier · Computational Biology Dashboard</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <!-- Collapsible Streamlit-Style Sidebar -->
+    <aside class="sidebar" id="sidebar" aria-label="Model and dataset configuration">
+      <div class="sidebar-header">
+        <div class="brand">
+          <div class="brand-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M2 15c6.667-6 13.333 0 20-6" />
+              <path d="M9 22c1.798-1.998 2.518-3.995 2.807-5.993" />
+              <path d="M15 2c-1.798 1.998-2.518 3.995-2.807 5.993" />
+              <path d="M17 6l-2.5-2.5" />
+              <path d="M14 8l-1-1" />
+              <path d="M7 18l2.5 2.5" />
+              <path d="M3.5 14.5l.5.5" />
+              <path d="M20 9l.5.5" />
+              <path d="M6.5 12.5l1 1" />
+              <path d="M16.5 10.5l1 1" />
+              <path d="M10 16l1.5 1.5" />
+            </svg>
+          </div>
+          <div>
+            <div class="brand-title">BioSeqML</div>
+            <div class="brand-sub">DNA Classification Studio</div>
+          </div>
+        </div>
+        <button class="icon-btn mobile-only" id="closeSidebarBtn" type="button" title="Close sidebar" aria-label="Close sidebar">✕</button>
+      </div>
+
+      <div class="sidebar-scroll">
+        <!-- Dataset Quick Controls -->
+        <section class="sidebar-section">
+          <div class="sidebar-section-title">1. Training Dataset</div>
+          <div class="sidebar-stat-pill" id="sidebarDatasetSummary">4 sequences · 2 groups</div>
+
+          <form id="quickAddForm" class="quick-add-form" novalidate>
+            <div class="form-row-2">
+              <label class="field">
+                <span>Seq ID</span>
+                <input type="text" id="addSeqId" placeholder="S5" maxlength="20" required />
+              </label>
+              <label class="field">
+                <span>Group</span>
+                <input type="text" id="addSeqGroup" placeholder="Group A" list="groupSuggestions" required />
+                <datalist id="groupSuggestions">
+                  <option value="Group A"></option>
+                  <option value="Group B"></option>
+                </datalist>
+              </label>
+            </div>
+            <label class="field">
+              <span>DNA Sequence (A, T, G, C)</span>
+              <input type="text" id="addSeqInput" class="mono" placeholder="ATGCGTAC" required />
+            </label>
+            <div class="validation-mini" id="addSeqValidation" hidden></div>
+            <button type="submit" class="btn btn-secondary btn-full">+ Add to Dataset</button>
+          </form>
+
+          <div class="sidebar-btn-row">
+            <button type="button" id="resetDatasetBtn" class="btn btn-ghost btn-sm">Reset Default</button>
+            <button type="button" id="exportCsvBtn" class="btn btn-ghost btn-sm">Export CSV</button>
+          </div>
+        </section>
+
+        <!-- Classifier & Hyperparameters -->
+        <section class="sidebar-section">
+          <div class="sidebar-section-title">2. Model &amp; Hyperparameters</div>
+
+          <label class="field">
+            <span>Classifier Algorithm</span>
+            <select id="classifierSelect">
+              <option value="random_forest" selected>Random Forest Classifier</option>
+              <option value="decision_tree">Decision Tree Classifier</option>
+            </select>
+          </label>
+
+          <label class="field">
+            <span>Split Criterion</span>
+            <select id="criterionSelect">
+              <option value="gini" selected>Gini Impurity</option>
+              <option value="entropy">Entropy (Info Gain)</option>
+            </select>
+          </label>
+
+          <div class="field">
+            <div class="range-head">
+              <span>max_depth</span>
+              <strong id="maxDepthValue">5</strong>
+            </div>
+            <input type="range" id="maxDepthRange" min="1" max="10" value="5" />
+            <label class="checkbox-inline">
+              <input type="checkbox" id="unlimitedDepthCheck" />
+              <span>Unlimited depth (None)</span>
+            </label>
+          </div>
+
+          <div class="field" id="nEstimatorsGroup">
+            <div class="range-head">
+              <span>n_estimators (Trees)</span>
+              <strong id="nEstimatorsValue">50</strong>
+            </div>
+            <input type="range" id="nEstimatorsRange" min="5" max="150" step="5" value="50" />
+          </div>
+
+          <div class="field" id="maxFeaturesGroup">
+            <span>max_features (Per Split)</span>
+            <select id="maxFeaturesSelect">
+              <option value="sqrt" selected>sqrt (2 of 6 features)</option>
+              <option value="all">all (6 features)</option>
+            </select>
+          </div>
+
+          <div class="form-row-2">
+            <label class="field">
+              <span>min_samples_split</span>
+              <input type="number" id="minSamplesInput" min="2" max="10" value="2" />
+            </label>
+            <label class="field">
+              <span>random_state</span>
+              <input type="number" id="randomStateInput" min="0" max="99999" value="42" />
+            </label>
+          </div>
+        </section>
+
+        <!-- Evaluation Strategy -->
+        <section class="sidebar-section">
+          <div class="sidebar-section-title">3. Training &amp; Validation</div>
+
+          <label class="field">
+            <span>Validation Strategy</span>
+            <select id="evalModeSelect">
+              <option value="full" selected>Full-Fit (All Samples)</option>
+              <option value="loocv">Leave-One-Out CV (LOOCV)</option>
+              <option value="split">Stratified Train / Test Split</option>
+            </select>
+          </label>
+
+          <div class="field" id="testRatioGroup" hidden>
+            <div class="range-head">
+              <span>Test Split Size</span>
+              <strong id="testRatioValue">50%</strong>
+            </div>
+            <input type="range" id="testRatioRange" min="25" max="50" step="25" value="50" />
+          </div>
+
+          <button type="button" id="retrainBtn" class="btn btn-primary btn-full">Retrain Classifier</button>
+        </section>
+
+        <!-- Report Shortcuts -->
+        <section class="sidebar-section">
+          <div class="sidebar-section-title">4. Academic Deliverable</div>
+          <div class="sidebar-btn-col">
+            <button type="button" id="sidebarPrintBtn" class="btn btn-secondary btn-full">Export PDF / Print Report</button>
+            <button type="button" id="sidebarMdBtn" class="btn btn-ghost btn-full">Download Markdown (.md)</button>
+          </div>
+        </section>
+      </div>
+    </aside>
+
+    <!-- Main Dashboard Workspace -->
+    <div class="main-wrap">
+      <header class="topbar">
+        <div class="topbar-left">
+          <button class="icon-btn mobile-only" id="openSidebarBtn" type="button" title="Open sidebar" aria-label="Open sidebar">☰</button>
+          <div>
+            <h1>DNA Sequence Classification Dashboard</h1>
+            <p class="topbar-subtitle">Computational Biology Assignment · Nucleotide Feature Extraction, Tree Ensembles &amp; Genomic Inference</p>
+          </div>
+        </div>
+        <div class="topbar-actions">
+          <button type="button" id="themeToggleBtn" class="btn btn-ghost btn-sm" title="Toggle Light/Dark Theme">
+            <span id="themeIcon">🌙</span> <span id="themeLabel">Dark Mode</span>
+          </button>
+        </div>
+      </header>
+
+      <!-- KPI Summary Strip -->
+      <section class="kpi-strip" aria-label="Key dashboard metrics">
+        <div class="kpi-card">
+          <div class="kpi-label">Dataset Sequences</div>
+          <div class="kpi-value" id="kpiDatasetCount">4</div>
+          <div class="kpi-sub" id="kpiDatasetSub">2 groups · 8 bp avg</div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-label">Active Classifier</div>
+          <div class="kpi-value" id="kpiModelName">Random Forest</div>
+          <div class="kpi-sub" id="kpiModelSub">50 trees · Gini</div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-label">Model Accuracy</div>
+          <div class="kpi-value" id="kpiAccuracy">100.0%</div>
+          <div class="kpi-sub" id="kpiAccuracySub">Full-Fit (4/4)</div>
+        </div>
+        <div class="kpi-card kpi-card-highlight">
+          <div class="kpi-label">Unknown Prediction</div>
+          <div class="kpi-value" id="kpiPrediction">Group B</div>
+          <div class="kpi-sub" id="kpiPredictionSub">Test · Confidence</div>
+        </div>
+      </section>
+
+      <!-- Navigation Tabs -->
+      <nav class="tab-bar" role="tablist" aria-label="Dashboard sections">
+        <button type="button" class="tab-btn active" role="tab" aria-selected="true" data-tab="features">
+          Feature Extraction
+        </button>
+        <button type="button" class="tab-btn" role="tab" aria-selected="false" data-tab="training">
+          Model Training
+        </button>
+        <button type="button" class="tab-btn" role="tab" aria-selected="false" data-tab="predict">
+          Predict Unknown
+        </button>
+        <button type="button" class="tab-btn" role="tab" aria-selected="false" data-tab="discussion">
+          Analysis &amp; Discussion
+        </button>
+      </nav>
+
+      <!-- TAB 1: FEATURE EXTRACTION -->
+      <main class="tab-content active" id="tab-features" role="tabpanel">
+        <div class="card">
+          <div class="card-header">
+            <div>
+              <h2>Training Dataset &amp; Extracted Feature Table</h2>
+              <p class="card-sub">Edit Sequence ID, DNA sequence (A/T/G/C), or Group inline. Click any column header to sort.</p>
+            </div>
+            <div class="card-actions">
+              <select id="groupFilterSelect" class="select-sm" aria-label="Filter by group">
+                <option value="ALL">All Groups</option>
+              </select>
+              <button type="button" id="addRowBtn" class="btn btn-secondary btn-sm">+ Add Row</button>
+            </div>
+          </div>
+
+          <div class="table-wrap">
+            <table class="data-table" id="featureTable">
+              <thead>
+                <tr>
+                  <th data-sort="id" class="sortable">Seq ID <span class="sort-ind"></span></th>
+                  <th data-sort="group" class="sortable">Group <span class="sort-ind"></span></th>
+                  <th data-sort="sequence" class="sortable">DNA Sequence <span class="sort-ind"></span></th>
+                  <th data-sort="countA" class="sortable num">Count 'A' <span class="sort-ind"></span></th>
+                  <th data-sort="countT" class="sortable num">Count 'T' <span class="sort-ind"></span></th>
+                  <th data-sort="countG" class="sortable num">Count 'G' <span class="sort-ind"></span></th>
+                  <th data-sort="countC" class="sortable num">Count 'C' <span class="sort-ind"></span></th>
+                  <th data-sort="length" class="sortable num">Length <span class="sort-ind"></span></th>
+                  <th data-sort="gcContent" class="sortable num">GC Content (%) <span class="sort-ind"></span></th>
+                  <th class="num">Action</th>
+                </tr>
+              </thead>
+              <tbody id="featureTableBody"></tbody>
+            </table>
+          </div>
+          <div id="datasetValidationBanner" class="alert-banner alert-error" hidden></div>
+        </div>
+
+        <div class="grid-2">
+          <div class="card">
+            <div class="card-header">
+              <div>
+                <h3>GC Content (%) Across Sequences</h3>
+                <p class="card-sub">Formula: <code>((G + C) / Length) × 100</code> — hover bars for base counts</p>
+              </div>
+            </div>
+            <div class="chart-box" id="gcBarChart"></div>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <div>
+                <h3>Group-Level Feature Centroids</h3>
+                <p class="card-sub">Mean values of the 6 mandatory features per biological group</p>
+              </div>
+            </div>
+            <div id="groupSummaryContainer"></div>
+          </div>
+        </div>
+      </main>
+
+      <!-- TAB 2: MODEL TRAINING -->
+      <main class="tab-content" id="tab-training" role="tabpanel" hidden>
+        <div id="trainingStatusBanner" class="info-banner"></div>
+
+        <div class="metrics-grid-3">
+          <div class="card metric-card">
+            <div class="metric-title">Accuracy Score</div>
+            <div class="metric-big" id="metricAccuracy">—</div>
+            <div class="metric-foot" id="metricAccuracyDetail">—</div>
+          </div>
+          <div class="card metric-card">
+            <div class="metric-title">Macro F1-Score</div>
+            <div class="metric-big" id="metricMacroF1">—</div>
+            <div class="metric-foot">Balanced precision &amp; recall</div>
+          </div>
+          <div class="card metric-card">
+            <div class="metric-title">Top Discriminating Feature</div>
+            <div class="metric-big metric-big-sm" id="metricTopFeature">—</div>
+            <div class="metric-foot" id="metricTopFeatureVal">—</div>
+          </div>
+        </div>
+
+        <div class="grid-2">
+          <div class="card">
+            <div class="card-header">
+              <div>
+                <h3>Confusion Matrix</h3>
+                <p class="card-sub" id="confusionSubtitle">Actual vs. Predicted group counts</p>
+              </div>
+            </div>
+            <div id="confusionMatrixContainer"></div>
+            <div id="perClassMetricsContainer" class="per-class-wrap"></div>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <div>
+                <h3>Feature Importance (Impurity Decrease)</h3>
+                <p class="card-sub">Relative contribution of each nucleotide metric to classification splits</p>
+              </div>
+            </div>
+            <div class="chart-box" id="featureImportanceChart"></div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <div>
+              <h3>Learned Decision Rules Inspector</h3>
+              <p class="card-sub">Inspect the exact split thresholds discovered by the classifier</p>
+            </div>
+          </div>
+          <pre class="rules-box" id="treeRulesOutput"></pre>
+        </div>
+      </main>
+
+      <!-- TAB 3: PREDICT UNKNOWN -->
+      <main class="tab-content" id="tab-predict" role="tabpanel" hidden>
+        <div class="grid-predict">
+          <!-- Input & Presets -->
+          <div class="card">
+            <div class="card-header">
+              <div>
+                <h3>Unknown DNA Sequence Input</h3>
+                <p class="card-sub">Enter an unknown sequence (valid bases: A, T, G, C) to classify its group</p>
+              </div>
+            </div>
+
+            <form id="predictForm" novalidate>
+              <div class="predict-inputs-row">
+                <label class="field predict-id-field">
+                  <span>Sequence ID</span>
+                  <input type="text" id="unknownIdInput" value="Test" maxlength="24" />
+                </label>
+                <label class="field predict-seq-field">
+                  <span>DNA Sequence</span>
+                  <input type="text" id="unknownSeqInput" class="mono input-lg" value="ATGCGCGATC" placeholder="e.g. ATGCGCGATC" autocomplete="off" spellcheck="false" />
+                </label>
+              </div>
+
+              <div class="validator-pill valid" id="unknownValidatorPill">
+                <span class="dot"></span>
+                <span id="unknownValidatorText">Valid DNA sequence (10 bp, bases A/T/G/C only).</span>
+              </div>
+
+              <div class="predict-action-row">
+                <button type="submit" id="predictBtn" class="btn btn-primary btn-lg">Predict Group</button>
+                <button type="button" id="resetUnknownBtn" class="btn btn-ghost">Reset to Test (ATGCGCGATC)</button>
+              </div>
+            </form>
+
+            <div class="presets-block">
+              <div class="presets-label">Experiment &amp; Out-of-Distribution Presets:</div>
+              <div class="preset-chips" id="presetChips"></div>
+            </div>
+
+            <div class="ribbon-block">
+              <div class="presets-label">Nucleotide Composition Strip:</div>
+              <div class="dna-ribbon" id="dnaRibbon"></div>
+            </div>
+          </div>
+
+          <!-- Prediction Result Callout -->
+          <div class="card result-card" id="predictionResultCard">
+            <div class="result-badge-row">
+              <span class="result-eyebrow">Inference Output</span>
+              <span class="model-tag" id="predictModelTag">Random Forest</span>
+            </div>
+            <div class="result-hero" id="predictResultHero">
+              <div class="result-label">Predicted: <span id="predictedClassLabel">Group B</span></div>
+              <div class="result-confidence" id="predictedConfidenceText">Confidence: —</div>
+            </div>
+
+            <div class="prob-section">
+              <div class="prob-heading">Class Probabilities</div>
+              <div id="probabilityBars"></div>
+            </div>
+
+            <div class="explain-section" id="predictionExplanation"></div>
+          </div>
+        </div>
+
+        <!-- 6 Extracted Features Badges -->
+        <div class="card">
+          <div class="card-header">
+            <div>
+              <h3>Extracted Features for Input Sequence</h3>
+              <p class="card-sub">Computed in real time prior to classifier inference</p>
+            </div>
+          </div>
+          <div class="feature-badges-grid" id="unknownFeatureBadges"></div>
+        </div>
+
+        <!-- Normalized Composition Comparison -->
+        <div class="card">
+          <div class="card-header">
+            <div>
+              <h3>Length-Normalized Composition Comparison (%)</h3>
+              <p class="card-sub">Compares relative base percentages of the unknown sequence against Group A &amp; Group B means (exposes length-scaling bias vs raw counts)</p>
+            </div>
+          </div>
+          <div class="chart-box" id="compositionCompareChart"></div>
+        </div>
+      </main>
+
+      <!-- TAB 4: ANALYSIS & DISCUSSION -->
+      <main class="tab-content" id="tab-discussion" role="tabpanel" hidden>
+        <div class="card deliverable-banner">
+          <div>
+            <h2>Academic Deliverable Mode — Report &amp; Discussion</h2>
+            <p class="card-sub">Live synthesis backed by your trained model's feature importances, confusion matrix, and inference diagnostics.</p>
+          </div>
+          <div class="export-actions">
+            <button type="button" id="copyMdBtn" class="btn btn-ghost">Copy Markdown</button>
+            <button type="button" id="downloadMdBtn" class="btn btn-secondary">Download Report (.md)</button>
+            <button type="button" id="exportPdfBtn" class="btn btn-primary">Export Report / Print PDF</button>
+          </div>
+        </div>
+
+        <div id="discussionCardsContainer" class="discussion-stack"></div>
+      </main>
+    </div>
+  </div>
+
+  <!-- Dedicated Print / PDF Export Container (visible only during @media print) -->
+  <section id="printReportView" class="print-only" aria-hidden="true"></section>
+
+  <!-- Toast Notification -->
+  <div id="toast" class="toast" hidden></div>
+
+  <script src="src/features.js"></script>
+  <script src="src/ml.js"></script>
+  <script src="src/charts.js"></script>
+  <script src="src/report.js"></script>
+  <script src="src/app.js"></script>
+</body>
+</html>
