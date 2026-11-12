@@ -22,13 +22,6 @@ from sklearn.model_selection import LeaveOneOut, train_test_split
 from sklearn.tree import DecisionTreeClassifier, export_text
 import streamlit as st
 
-st.set_page_config(
-    page_title="DNA Sequence Classification Dashboard",
-    page_icon="🧬",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
-
 # ---------------------------------------------------------------------------
 # Constants & Sample Datasets
 # ---------------------------------------------------------------------------
@@ -824,11 +817,33 @@ def _ascii_safe(text: str) -> str:
     return out.encode("latin-1", errors="replace").decode("latin-1")
 
 
-def _pdf_to_bytes(pdf) -> bytes:
+def _pdf_is_v2() -> bool:
     import fpdf
 
-    major_ver = int(str(getattr(fpdf, "__version__", "2")).split(".")[0])
-    out = pdf.output(dest="S") if major_ver < 2 else pdf.output()
+    return int(str(getattr(fpdf, "__version__", "2")).split(".")[0]) >= 2
+
+
+def _pdf_cell_line(pdf, h: float, text: str) -> None:
+    pdf.set_x(pdf.l_margin)
+    eff_w = max(40.0, pdf.w - pdf.l_margin - pdf.r_margin)
+    if _pdf_is_v2():
+        pdf.cell(eff_w, h, _ascii_safe(text), new_x="LMARGIN", new_y="NEXT")
+    else:
+        pdf.cell(eff_w, h, _ascii_safe(text), ln=1)
+
+
+def _pdf_para(pdf, h: float, text: str) -> None:
+    pdf.set_x(pdf.l_margin)
+    eff_w = max(40.0, pdf.w - pdf.l_margin - pdf.r_margin)
+    if _pdf_is_v2():
+        pdf.multi_cell(eff_w, h, _ascii_safe(text), new_x="LMARGIN", new_y="NEXT")
+    else:
+        pdf.multi_cell(eff_w, h, _ascii_safe(text))
+    pdf.set_x(pdf.l_margin)
+
+
+def _pdf_to_bytes(pdf) -> bytes:
+    out = pdf.output() if _pdf_is_v2() else pdf.output(dest="S")
     if isinstance(out, (bytes, bytearray)):
         return bytes(out)
     return str(out).encode("latin-1", errors="replace")
@@ -851,28 +866,29 @@ def build_pdf_report(
     pdf.add_page()
 
     pdf.set_font("Helvetica", "B", 15)
-    pdf.cell(0, 9, _ascii_safe("DNA Sequence Classification - Academic Report"), ln=1)
+    _pdf_cell_line(pdf, 9, "DNA Sequence Classification - Academic Report")
     pdf.set_font("Helvetica", "", 9.5)
     model_name = "Decision Tree Classifier" if config.get("classifier") == "decision_tree" else "Random Forest Classifier"
-    pdf.cell(
-        0,
+    _pdf_cell_line(
+        pdf,
         6,
-        _ascii_safe(f"Generated {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')} | Model: {model_name}"),
-        ln=1,
+        f"Generated {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')} | Model: {model_name}",
     )
     pdf.ln(3)
 
     pdf.set_font("Helvetica", "B", 12)
-    pdf.cell(0, 7, "1. Training Dataset & Extracted Features", ln=1)
+    _pdf_cell_line(pdf, 7, "1. Training Dataset & Extracted Features")
     pdf.set_font("Helvetica", "B", 8.5)
     col_widths = [18, 22, 42, 12, 12, 12, 12, 16, 22]
     headers = ["ID", "Group", "Sequence", "A", "T", "G", "C", "Len", "GC %"]
+    pdf.set_x(pdf.l_margin)
     for w, h in zip(col_widths, headers):
         pdf.cell(w, 6, h, border=1)
     pdf.ln()
 
     pdf.set_font("Helvetica", "", 8.5)
     for _, r in valid_df.iterrows():
+        pdf.set_x(pdf.l_margin)
         vals = [
             str(r["Sequence ID"])[:10],
             str(r["Group"])[:12],
@@ -890,27 +906,25 @@ def build_pdf_report(
     pdf.ln(4)
 
     pdf.set_font("Helvetica", "B", 12)
-    pdf.cell(0, 7, "2. Model Evaluation & Feature Importance", ln=1)
+    _pdf_cell_line(pdf, 7, "2. Model Evaluation & Feature Importance")
     pdf.set_font("Helvetica", "", 9.5)
     if train_result and not train_result.get("error"):
-        pdf.multi_cell(
-            0,
+        _pdf_para(
+            pdf,
             5.5,
-            _ascii_safe(
-                f"Evaluation: {train_result['eval_description']}\n"
-                f"Accuracy: {train_result['accuracy']*100:.1f}% ({train_result['correct']}/{train_result['total']}) | "
-                f"Macro-F1: {train_result['macro_f1']*100:.1f}%"
-            ),
+            f"Evaluation: {train_result['eval_description']}\n"
+            f"Accuracy: {train_result['accuracy']*100:.1f}% ({train_result['correct']}/{train_result['total']}) | "
+            f"Macro-F1: {train_result['macro_f1']*100:.1f}%",
         )
         pdf.ln(1)
         for _, row in train_result["feature_importances_df"].iterrows():
-            pdf.cell(0, 5, _ascii_safe(f"  - {row['Feature']}: {row['Importance (%)']:.1f}%"), ln=1)
+            _pdf_cell_line(pdf, 5, f"  - {row['Feature']}: {row['Importance (%)']:.1f}%")
     else:
-        pdf.cell(0, 6, "Model training unavailable.", ln=1)
+        _pdf_cell_line(pdf, 6, "Model training unavailable.")
     pdf.ln(3)
 
     pdf.set_font("Helvetica", "B", 12)
-    pdf.cell(0, 7, "3. Unknown Sequence Prediction", ln=1)
+    _pdf_cell_line(pdf, 7, "3. Unknown Sequence Prediction")
     pdf.set_font("Helvetica", "", 9.5)
     if prediction_result and not prediction_result.get("error"):
         f = prediction_result["features"]
@@ -918,28 +932,26 @@ def build_pdf_report(
             f"{cls}: {p*100:.1f}%"
             for cls, p in sorted(prediction_result["probabilities"].items(), key=lambda kv: -kv[1])
         )
-        pdf.multi_cell(
-            0,
+        _pdf_para(
+            pdf,
             5.5,
-            _ascii_safe(
-                f"Target: {prediction_result['id']} ({f['sequence']})\n"
-                f"Features: A={f['count_a']}, T={f['count_t']}, G={f['count_g']}, C={f['count_c']}, "
-                f"Length={f['length']} bp, GC={f['gc_content']:.1f}%\n"
-                f"Predicted Group: {prediction_result['predicted_class']} ({probs})"
-            ),
+            f"Target: {prediction_result['id']} ({f['sequence']})\n"
+            f"Features: A={f['count_a']}, T={f['count_t']}, G={f['count_g']}, C={f['count_c']}, "
+            f"Length={f['length']} bp, GC={f['gc_content']:.1f}%\n"
+            f"Predicted Group: {prediction_result['predicted_class']} ({probs})",
         )
     else:
-        pdf.cell(0, 6, "No valid inference result available.", ln=1)
+        _pdf_cell_line(pdf, 6, "No valid inference result available.")
     pdf.ln(4)
 
     pdf.set_font("Helvetica", "B", 12)
-    pdf.cell(0, 7, "4. Critical Discussion & Analysis", ln=1)
+    _pdf_cell_line(pdf, 7, "4. Critical Discussion & Analysis")
     for sec in discussion:
         pdf.set_font("Helvetica", "B", 10)
-        pdf.multi_cell(0, 5.5, _ascii_safe(f"{sec['num']}. {sec['title']}"))
+        _pdf_para(pdf, 5.5, f"{sec['num']}. {sec['title']}")
         pdf.set_font("Helvetica", "", 9.2)
         for p in sec["paragraphs"]:
-            pdf.multi_cell(0, 5, _ascii_safe(p))
+            _pdf_para(pdf, 5, p)
             pdf.ln(1)
         pdf.ln(1.5)
 
@@ -1562,6 +1574,12 @@ def render_tab_discussion(enriched_df: pd.DataFrame, train_result: dict, pred_re
 
 
 def main() -> None:
+    st.set_page_config(
+        page_title="DNA Sequence Classification Dashboard",
+        page_icon="🧬",
+        layout="wide",
+        initial_sidebar_state="expanded",
+    )
     inject_custom_css()
     init_state()
 
